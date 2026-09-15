@@ -1,0 +1,7 @@
+[package]
+name = "loglint"
+version = "0.1.0"
+edition = "2021"
+authors = ["mona-b91"]
+description = "Strict-by-default parser and pretty printer for a structured log line format"
+license = "MIT"
