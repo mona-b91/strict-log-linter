@@ -448,3 +448,163 @@ fn validate_module(s: &str) -> Result<(), ParseError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(ts: &str, level: &str, module: &str, message: &str, fields: &str) -> String {
+        if fields.is_empty() {
+            format!("{} {} {}: {}", ts, level, module, message)
+        } else {
+            format!("{} {} {}: {} | {}", ts, level, module, message, fields)
+        }
+    }
+
+    // --- leap years ---
+
+    #[test]
+    fn leap_year_feb_29_divisible_by_4_is_valid() {
+        let ts = parse_timestamp("2024-02-29T00:00:00.000Z").unwrap();
+        assert_eq!(ts.day, 29);
+    }
+
+    #[test]
+    fn non_leap_year_feb_29_is_rejected() {
+        let err = parse_timestamp("2023-02-29T00:00:00.000Z").unwrap_err();
+        assert!(err.contains("day 29 out of range"));
+    }
+
+    #[test]
+    fn century_year_not_divisible_by_400_is_not_leap() {
+        let err = parse_timestamp("1900-02-29T00:00:00.000Z").unwrap_err();
+        assert!(err.contains("day 29 out of range"));
+    }
+
+    #[test]
+    fn century_year_divisible_by_400_is_leap() {
+        let ts = parse_timestamp("2000-02-29T00:00:00.000Z").unwrap();
+        assert_eq!(ts.day, 29);
+    }
+
+    #[test]
+    fn strict_mode_rejects_bad_timestamp_entirely() {
+        let input = line("2023-02-29T00:00:00.000Z", "INFO", "a", "msg", "");
+        let err = parse_line(&input, false).unwrap_err();
+        assert!(err.0.contains("invalid timestamp"));
+    }
+
+    #[test]
+    fn lenient_mode_recovers_bad_timestamp_as_none() {
+        let input = line("2023-02-29T00:00:00.000Z", "INFO", "a", "msg", "");
+        let entry = parse_line(&input, true).unwrap();
+        assert!(entry.timestamp.is_none());
+    }
+
+    // --- escaping ---
+
+    #[test]
+    fn quoted_value_unescapes_backslash_and_quote() {
+        let (key, value) = parse_field(r#"note="say \"hi\" then \\ done""#).unwrap();
+        assert_eq!(key, "note");
+        assert_eq!(value, "say \"hi\" then \\ done");
+    }
+
+    #[test]
+    fn unquoted_value_with_stray_quote_is_rejected() {
+        let err = parse_field(r#"note=say"hi"#).unwrap_err();
+        assert!(err.contains("stray quote"));
+    }
+
+    #[test]
+    fn unterminated_quote_is_strict_error_and_lenient_recovery_drops_field() {
+        let input = line(
+            "2024-01-01T00:00:00.000Z",
+            "INFO",
+            "a",
+            "msg",
+            r#"a=1 broken="still going"#,
+        );
+        let err = parse_line(&input, false).unwrap_err();
+        assert!(err.0.contains("unterminated"));
+
+        let entry = parse_line(&input, true).unwrap();
+        assert_eq!(entry.fields, vec![("a".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn escaped_backslash_pair_collapses_to_one() {
+        let (key, value) = parse_field(r#"path="C:\\\\""#).unwrap();
+        assert_eq!(key, "path");
+        assert_eq!(value, r"C:\\");
+    }
+
+    // --- duplicate keys ---
+
+    #[test]
+    fn strict_mode_rejects_duplicate_field_key() {
+        let input = line("2024-01-01T00:00:00.000Z", "INFO", "a", "msg", "id=1 id=2");
+        let err = parse_line(&input, false).unwrap_err();
+        assert!(err.0.contains("duplicate field key 'id'"));
+    }
+
+    #[test]
+    fn lenient_mode_keeps_last_occurrence_of_duplicate_key() {
+        let input = line("2024-01-01T00:00:00.000Z", "INFO", "a", "msg", "id=1 id=2");
+        let entry = parse_line(&input, true).unwrap();
+        assert_eq!(entry.fields, vec![("id".to_string(), "2".to_string())]);
+    }
+
+    // --- module / level leniency ---
+
+    #[test]
+    fn strict_mode_requires_module_colon() {
+        let input = "2024-01-01T00:00:00.000Z INFO auth session";
+        let err = parse_line(input, false).unwrap_err();
+        assert!(err.0.contains("expected module name"));
+    }
+
+    #[test]
+    fn lenient_mode_falls_back_to_raw_token_as_module() {
+        let input = "2024-01-01T00:00:00.000Z INFO auth session";
+        let entry = parse_line(input, true).unwrap();
+        assert_eq!(entry.module, "auth");
+    }
+
+    #[test]
+    fn strict_mode_rejects_unknown_level() {
+        let input = line("2024-01-01T00:00:00.000Z", "VERBOSE", "a", "msg", "");
+        let err = parse_line(&input, false).unwrap_err();
+        assert!(err.0.contains("unknown level"));
+    }
+
+    #[test]
+    fn lenient_mode_keeps_unknown_level_verbatim() {
+        let input = line("2024-01-01T00:00:00.000Z", "VERBOSE", "a", "msg", "");
+        let entry = parse_line(&input, true).unwrap();
+        assert_eq!(entry.level.as_str(), "VERBOSE");
+    }
+
+    // --- full round trip ---
+
+    #[test]
+    fn well_formed_line_parses_with_ordered_fields() {
+        let input = line(
+            "2026-09-16T10:23:01.123Z",
+            "INFO",
+            "auth.session",
+            "user logged in",
+            "user_id=42 ip=10.0.0.5",
+        );
+        let entry = parse_line(&input, false).unwrap();
+        assert_eq!(entry.module, "auth.session");
+        assert_eq!(entry.message, "user logged in");
+        assert_eq!(
+            entry.fields,
+            vec![
+                ("user_id".to_string(), "42".to_string()),
+                ("ip".to_string(), "10.0.0.5".to_string()),
+            ]
+        );
+    }
+}
